@@ -1,5 +1,6 @@
+import { readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   flagsDir,
   machineConfigPath,
@@ -17,8 +18,64 @@ export function expandHome(text: string, home = homedir()): string {
 }
 
 export function resolveTarget(projectDir: string, word: string, home = homedir()): string {
+  return resolveFrom(projectDir, word, home);
+}
+
+// why: `resolveTarget` names the shape every existing caller already uses — one fixed base. AD-146's `cd`/`-C`
+// tracking resolves the same word against several candidate bases in turn (the project root plus every cwd a
+// `cd`/`pushd`/`git -C` earlier in the command could have reached), so the base itself has to be a parameter.
+export function resolveFrom(base: string, word: string, home = homedir()): string {
   const expanded = expandHome(word, home);
-  return isAbsolute(expanded) ? resolve(expanded) : resolve(projectDir, expanded);
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(base, expanded);
+}
+
+/**
+ * The main checkout of a linked git worktree, or `null` when `dir` is not one.
+ *
+ * why: a linked worktree's own `.git` is a file naming `gitdir: <path>`, and that directory's `commondir` file
+ * names the shared `.git` every worktree of the same repository points at — the same two markers `git` itself
+ * reads to answer the question. Nothing here shells out to `git`: the floor decides before any process is worth
+ * spawning, and both markers are small, fixed-format files ([/decisions/ad-146.md](/decisions/ad-146.md)).
+ * invariant: a missing or malformed marker resolves to "not a linked worktree" rather than guessed — the same
+ * prove-safe posture as every other read in this module.
+ */
+function readWorktreeMarker(dir: string): string | null {
+  let marker: string;
+  try {
+    marker = readFileSync(join(dir, ".git"), "utf8");
+  } catch {
+    return null;
+  }
+  const gitdirText = /^gitdir:\s*(.+?)\s*$/m.exec(marker)?.[1];
+  if (!gitdirText) {
+    return null;
+  }
+  const gitdir = resolve(dir, gitdirText);
+  let commondirText: string;
+  try {
+    commondirText = readFileSync(join(gitdir, "commondir"), "utf8");
+  } catch {
+    return null;
+  }
+  const root = dirname(resolve(gitdir, commondirText.trim()));
+  return root === resolve(dir) ? null : root;
+}
+
+// why: `checkPolicySurface` calls `mainWorktreeOf` once per candidate root per word it resolves, and a hook
+// evaluates a floor decision on every tool call — the two on-disk reads this does are cheap once, not free
+// on every call. A directory's worktree relationship does not change mid-process, so a per-process cache is
+// exact, not an approximation ([/decisions/ad-146.md](/decisions/ad-146.md)).
+const MAIN_WORKTREE_CACHE = new Map<string, string | null>();
+
+export function mainWorktreeOf(dir: string): string | null {
+  const key = resolve(dir);
+  const cached = MAIN_WORKTREE_CACHE.get(key);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const result = readWorktreeMarker(dir);
+  MAIN_WORKTREE_CACHE.set(key, result);
+  return result;
 }
 
 export function isInside(parent: string, child: string): boolean {

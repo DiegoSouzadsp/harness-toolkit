@@ -20,7 +20,11 @@ export type ShellSegment = {
 };
 
 const SEPARATORS = new Set([";", "|", "&", "\n"]);
-const ESCAPABLE = new Set([" ", "\t", '"', "'", "$", "`", "\\", ";", "|", "&", "(", ")"]);
+// why: `>`/`<` join the escapable set alongside the redirect-glued-`&` fix below — real bash itself treats
+// `\>`/`\<` as literal characters, not redirect operators (`echo a\>b` prints the one argument `a>b`), and
+// this tokenizer has to agree, or an escaped `>` would still register as a genuine redirect operator for the
+// `&`-drop check that follows.
+const ESCAPABLE = new Set([" ", "\t", '"', "'", "$", "`", "\\", ";", "|", "&", "(", ")", ">", "<"]);
 
 function isExpansion(text: string): boolean {
   return text.includes("$") || text.includes("`");
@@ -83,6 +87,12 @@ export function tokenizeShell(command: string): ShellSegment[] {
   let quote: '"' | "'" | null = null;
   let unbalanced = false;
   let depth = 0;
+  // why: `current.endsWith(">")` cannot tell a bare redirect operator from a `>` that arrived quoted
+  // (`"a>"`) or escaped (`\>`, now consumed whole by the `ESCAPABLE` branch above) — both leave the same
+  // trailing character in `current`. Tracked separately, and only ever set `true` by the one branch below
+  // that appends a genuinely bare, unquoted, unescaped `>`/`<`; every other branch that touches `current`
+  // clears it.
+  let lastCharWasBareRedirect = false;
 
   function pushWord(): void {
     if (current !== "" || currentHadQuote) {
@@ -95,6 +105,7 @@ export function tokenizeShell(command: string): ShellSegment[] {
     current = "";
     currentHadQuote = false;
     currentStartedQuoted = false;
+    lastCharWasBareRedirect = false;
   }
 
   function pushSegment(): void {
@@ -115,6 +126,7 @@ export function tokenizeShell(command: string): ShellSegment[] {
         quote = null;
       } else {
         current += char;
+        lastCharWasBareRedirect = false;
       }
       continue;
     }
@@ -130,6 +142,7 @@ export function tokenizeShell(command: string): ShellSegment[] {
       } else {
         current += char;
       }
+      lastCharWasBareRedirect = false;
       continue;
     }
 
@@ -139,6 +152,7 @@ export function tokenizeShell(command: string): ShellSegment[] {
         currentStartedQuoted = true;
       }
       currentHadQuote = true;
+      lastCharWasBareRedirect = false;
       continue;
     }
 
@@ -147,11 +161,34 @@ export function tokenizeShell(command: string): ShellSegment[] {
     if (char === "$" && (stripped[index + 1] === "(" || stripped[index + 1] === "{")) {
       depth += 1;
       current += char;
+      lastCharWasBareRedirect = false;
       continue;
     }
     if (depth > 0 && (char === ")" || char === "}")) {
       depth -= 1;
       current += char;
+      lastCharWasBareRedirect = false;
+      continue;
+    }
+
+    // hazard: `&` is a separator (background) on its own, but `N>&M`, `>&M`, `N<&M` (fd duplication) and
+    // `&>file`/`&>>file` (bash's combined stdout+stderr redirect) all carry one glued to a `>` or `<` — the
+    // separator check below used to fire on it regardless, splitting `git log … dev 2>&1 | head` into a
+    // segment ending in `2>` and a second, one-word segment `1`, which then got judged as a non-reader verb.
+    // Dropped rather than kept: keeping it would leave `>&.tlc/harness/config.json` tokenized with the `&`
+    // still glued to the front of the extracted target text (`&.tlc/harness/config.json`, a name that does
+    // not match the real surface path), silently defeating the redirect check it must still reach. Dropping
+    // it uniformly collapses every one of these forms to a plain `>`/`<` operator `redirectTargets` (and every
+    // other rule reading a word) already parses correctly — `2>&1` becomes `2>1`, a harmless fake filename
+    // no rule will ever match, and `>&file`/`&>file` both become `>file`, the real target intact.
+    // hazard (round 7): `current.endsWith(">")` cannot tell a genuine bare operator from a `>` that arrived
+    // quoted (`"a>"`) or escaped (`\>`) — both leave the same trailing character in `current`. That let
+    // `echo "a>"& python3 -c "…"` swallow the `&` as if it were glued to a real redirect, folding the
+    // `python3` command into `echo`'s argument list and hiding it from every floor rule (confirmed against
+    // real bash: the `&` there is a genuine background separator and the second command really runs).
+    // `lastCharWasBareRedirect` is only ever set `true` by the bare-character fallthrough below, and is
+    // cleared by every branch that appends quoted or escaped content, so it tracks exactly that distinction.
+    if (depth === 0 && char === "&" && (lastCharWasBareRedirect || stripped[index + 1] === ">")) {
       continue;
     }
 
@@ -166,6 +203,7 @@ export function tokenizeShell(command: string): ShellSegment[] {
     }
 
     current += char;
+    lastCharWasBareRedirect = char === ">" || char === "<";
   }
 
   if (quote !== null || depth > 0) {
